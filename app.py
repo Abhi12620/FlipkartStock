@@ -179,7 +179,7 @@ SECTION_HEADS = {
 OFFER_AMT_RE = re.compile(
     r"^(₹\s?[\d,]+(\.\d+)?|\d{1,2}(\.\d+)?\s?%)\s*(off\b|cashback\b|/\s?m(o|onth)?\b|per month\b)", re.I)
 STRONG_CARD = re.compile(
-    r"(CREDIT|DEBIT)\s+CARD|BANK|FINANCE|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|PNB|CITI|RBL|YES\b|ONECARD|BAJAJ|SLICE|UPI|WALLET|PAYTM|PHONEPE|CARDLESS|LAZYPAY|ZESTMONEY|SIMPL|PAY LATER|NO COST EMI", re.I)
+    r"(CREDIT|DEBIT)\s+CARD|BANK|FINANCE|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|PNB|CITI|RBL|YES\b|ONECARD|BAJAJ|SLICE|UPI|WALLET|PAYTM|PHONEPE|CARDLESS|LAZYPAY|ZESTMONEY|SIMPL|PAY LATER", re.I)
 JUNK_TXT = {"APPLY", "VIEW ALL", "VIEW ALL OFFERS", "T&C", "TERMS & CONDITIONS", "KNOW MORE"}
 
 
@@ -202,6 +202,8 @@ def _is_junk(s):
 
 def _amount_ok(s):
     if not OFFER_AMT_RE.match(s):
+        return False
+    if re.fullmatch(r"\d{1,2}(\.\d+)?\s?%\s*off", s.strip(), re.I):     # similar-products ka badge
         return False
     m = re.search(r"[\d,]+(\.\d+)?", s)
     return bool(m) and float(m.group(0).replace(",", "") or 0) > 0   # '₹0 off' hatao
@@ -306,15 +308,15 @@ def card_offers_tree(root, debug=None):
 
 
 def card_offers(raw):
-    """HTML ke visible strings se (fallback). Section headings bhi track karta hai."""
-    offers, state, i = [], {"sec": None}, 0
+    """HTML ke visible strings se (fallback). Sirf 'Bank offers' jaise heading ke baad ke ~60 strings."""
+    offers, sec, head_i, i = [], None, -999, 0
     n = len(raw)
     while i < n:
         t = raw[i].strip()
         h = SECTION_HEADS.get(t.upper())
         if h:
-            state["sec"] = h
-        elif _amount_ok(t) and not t.upper().startswith("BUY"):
+            sec, head_i = h, i
+        elif sec and i - head_i <= 60 and _amount_ok(t) and not t.upper().startswith("BUY"):
             grp, j = [t], i + 1
             while j < n and len(grp) < 5:
                 s = raw[j].strip()
@@ -323,7 +325,7 @@ def card_offers(raw):
                 grp.append(s)
                 j += 1
             if STRONG_CARD.search(" ".join(grp[1:])):
-                o = _make_offer(state["sec"], grp)
+                o = _make_offer(sec, grp)
                 if o["text"].lower() not in [x["text"].lower() for x in offers]:
                     offers.append(o)
             i = j - 1
@@ -336,13 +338,7 @@ def special_lines(raw):
     out = []
     for i, t in enumerate(raw):
         tu = t.strip().upper()
-        if tu == "EXCHANGE OFFER" or tu.startswith("EXCHANGE OFFER "):
-            nxt = [x.strip() for x in raw[i + 1:i + 5] if x.strip().upper() not in JUNK_TXT and not _is_junk(x.strip())]
-            joined = (t + " " + " ".join(nxt)).upper()
-            if "NOT AVAILABLE" in joined:
-                out.append({"sec": "Exchange", "text": "Not available at this pincode"})
-            # exchange value tumhare purane device pe depend karti hai -> skip
-        elif tu.startswith("BUY AT ₹"):
+        if tu.startswith("BUY AT ₹"):
             nxt = raw[i + 1].strip() if i + 1 < len(raw) else ""
             out.append({"sec": "Deal", "text": t.strip() + (" | " + nxt if nxt.upper().startswith("EMI") else "")})
     return out
@@ -390,8 +386,13 @@ def extract_details(raw_texts, price_from_ld, rome_json=None, rome_raw=None):
         offers.insert(0, {"sec": "Best card offer", "text": best["text"].replace("⭐ ", "")})
     seen = set()
     for o in special_lines(raw_texts) + special_lines(rome_raw or []):
-        if o["sec"] not in seen:                 # exchange/deal ek hi baar
+        if o["sec"] not in seen:                 # deal ek hi baar
             seen.add(o["sec"])
+            m = re.match(r"Buy at ₹\s?([\d,]+)", o["text"], re.I)
+            if m and price:
+                dp = int(m.group(1).replace(",", ""))
+                if 0 < dp < price:
+                    o["text"] += f"  (best offer ke saath ₹{price - dp:,} off)"
             offers.append(o)
     return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:30], "_raw_cards": raw_cards}
 
@@ -442,23 +443,34 @@ def check_single_product(url: str, pincode: str):
         # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware data
         rome_raw, rome_json, rome_note = [], None, "rome: no response"
         try:
-            path = re.sub(r"^https?://[^/]+", "", r0.url)
-            payload = {
-                "pageUri": path,
-                "locationContext": {"pincode": str(pincode), "changed": True},
-                "isReloadRequest": True,
-                "pageContext": {"fetchSeoData": True, "pageNumber": 1},
-            }
+            from urllib.parse import urlparse, parse_qsl, urlencode
+            pu = urlparse(r0.url)
+            q = dict(parse_qsl(pu.query))
+            clean_q = {k: v for k, v in q.items() if k in ("pid", "lid", "marketplace")}
+            full_uri = pu.path + ("?" + pu.query if pu.query else "")
+            clean_uri = pu.path + ("?" + urlencode(clean_q) if clean_q else "")
             rh = {**headers, "Accept": "*/*", "Content-Type": "application/json",
                   "X-user-agent": UA + " FKUA/website/42/website/Desktop",
                   "Origin": "https://www.flipkart.com"}
-            rr = s.post("https://2.rome.api.flipkart.com/api/4/page/fetch",
-                        headers=rh, json=payload, timeout=15)
-            if rr.status_code == 200:
-                rome_json = rr.json()
-                rome_raw = json_strings(rome_json)
-                rome_note = "rome:200"
-            else:
+            tries = [("2", clean_uri), ("2", full_uri), ("1", clean_uri)]
+            seen_t = set()
+            for n_try, (host, uri) in enumerate(tries, 1):
+                if (host, uri) in seen_t:
+                    continue
+                seen_t.add((host, uri))
+                payload = {
+                    "pageUri": uri,
+                    "locationContext": {"pincode": str(pincode), "changed": True},
+                    "isReloadRequest": True,
+                    "pageContext": {"fetchSeoData": True, "pageNumber": 1},
+                }
+                rr = s.post(f"https://{host}.rome.api.flipkart.com/api/4/page/fetch",
+                            headers=rh, json=payload, timeout=15)
+                if rr.status_code == 200:
+                    rome_json = rr.json()
+                    rome_raw = json_strings(rome_json)
+                    rome_note = "rome:200" + (f" (try {n_try})" if n_try > 1 else "")
+                    break
                 rome_note = f"rome:HTTP {rr.status_code}"
         except Exception as e:
             rome_note = f"rome error: {str(e)[:50]}"
