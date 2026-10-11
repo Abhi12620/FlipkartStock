@@ -19,8 +19,7 @@ CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "100"))  # 100 seconds
 PRODUCTS_FILE = "products.json"
 # ============================================
 
-# In-memory + file storage
-products = []          # list of dicts: {id, url, pincode, title, last_status, last_checked}
+products = []
 lock = threading.Lock()
 
 
@@ -45,7 +44,7 @@ def save_products():
 def send_telegram(message: str):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         print("⚠️ Telegram credentials missing")
-        return
+        return False
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     try:
         r = requests.post(url, json={
@@ -56,10 +55,13 @@ def send_telegram(message: str):
         }, timeout=12)
         if r.status_code == 200:
             print("✅ Telegram sent")
+            return True
         else:
             print("❌ Telegram error:", r.text[:200])
+            return False
     except Exception as e:
         print("❌ Telegram exception:", e)
+        return False
 
 
 def check_single_product(url: str, pincode: str):
@@ -79,7 +81,6 @@ def check_single_product(url: str, pincode: str):
         soup = BeautifulSoup(r.text, "html.parser")
         page_text = r.text.upper()
 
-        # Title
         title = "Product"
         for sel in [
             ("span", {"class": "VU-ZEz"}),
@@ -91,7 +92,6 @@ def check_single_product(url: str, pincode: str):
                 title = tag.get_text(strip=True)[:80]
                 break
 
-        # Stock detection
         if "NOTIFY ME" in page_text or "NOTIFYME" in page_text:
             return False, title
         if any(x in page_text for x in ["ADD TO CART", "BUY NOW", "ADDTOCART", "BUYNOW"]):
@@ -109,50 +109,62 @@ def check_single_product(url: str, pincode: str):
         return False, title
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
-        return None, "Error"
+        return None, "Error fetching"
+
+
+def update_product_status(product_id: str):
+    """Immediately check one product and update status + send notification if needed"""
+    with lock:
+        target = None
+        for p in products:
+            if p["id"] == product_id:
+                target = p
+                break
+        if not target:
+            return
+
+    in_stock, title = check_single_product(target["url"], target["pincode"])
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with lock:
+        for item in products:
+            if item["id"] == product_id:
+                item["title"] = title
+                item["last_checked"] = now
+                old_status = item.get("last_status")
+
+                if in_stock is True:
+                    item["last_status"] = "IN_STOCK"
+                    print(f"[{now}] ✅ IN STOCK → {title[:50]}")
+                    if old_status != "IN_STOCK":
+                        msg = (
+                            f"🔥 <b>STOCK AVAILABLE!</b>\n\n"
+                            f"<b>{title}</b>\n\n"
+                            f"📍 Pincode: {item['pincode']}\n"
+                            f"🔗 <a href='{item['url']}'>Open Product</a>"
+                        )
+                        send_telegram(msg)
+                elif in_stock is False:
+                    item["last_status"] = "OUT_OF_STOCK"
+                    print(f"[{now}] ❌ OUT OF STOCK → {title[:50]}")
+                else:
+                    item["last_status"] = "UNKNOWN"
+                break
+        save_products()
 
 
 def background_checker():
-    print("🚀 Multi-product checker started (interval: {}s)".format(CHECK_INTERVAL))
+    print(f"🚀 Multi-product checker started (interval: {CHECK_INTERVAL}s)")
     while True:
         with lock:
             current_list = list(products)
 
         for p in current_list:
             try:
-                in_stock, title = check_single_product(p["url"], p["pincode"])
-                now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                with lock:
-                    for item in products:
-                        if item["id"] == p["id"]:
-                            item["title"] = title
-                            item["last_checked"] = now
-                            old_status = item.get("last_status")
-
-                            if in_stock is True:
-                                item["last_status"] = "IN_STOCK"
-                                print(f"[{now}] ✅ IN STOCK → {title[:50]}")
-                                if old_status != "IN_STOCK":
-                                    msg = (
-                                        f"🔥 <b>STOCK AVAILABLE!</b>\n\n"
-                                        f"<b>{title}</b>\n\n"
-                                        f"📍 Pincode: {p['pincode']}\n"
-                                        f"🔗 <a href='{p['url']}'>Open Product</a>"
-                                    )
-                                    send_telegram(msg)
-                            elif in_stock is False:
-                                item["last_status"] = "OUT_OF_STOCK"
-                                print(f"[{now}] ❌ OUT OF STOCK → {title[:50]}")
-                            else:
-                                item["last_status"] = "UNKNOWN"
-                            break
-                    save_products()
-
+                update_product_status(p["id"])
             except Exception as e:
                 print("Item check error:", e)
-
-            time.sleep(2)  # small gap between products
+            time.sleep(2)
 
         time.sleep(CHECK_INTERVAL)
 
@@ -168,28 +180,34 @@ DASHBOARD_HTML = """
   <style>
     * { box-sizing: border-box; margin: 0; padding: 0; }
     body { font-family: system-ui, -apple-system, sans-serif; background: #0f172a; color: #e2e8f0; min-height: 100vh; padding: 20px; }
-    .container { max-width: 900px; margin: 0 auto; }
+    .container { max-width: 950px; margin: 0 auto; }
     h1 { font-size: 1.8rem; margin-bottom: 8px; color: #38bdf8; }
-    .sub { color: #94a3b8; margin-bottom: 24px; font-size: 0.95rem; }
+    .sub { color: #94a3b8; margin-bottom: 20px; font-size: 0.95rem; }
     .card { background: #1e293b; border-radius: 12px; padding: 20px; margin-bottom: 20px; border: 1px solid #334155; }
     .form-row { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
-    input { flex: 1; min-width: 200px; padding: 12px 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 0.95rem; }
+    input { flex: 1; min-width: 180px; padding: 12px 14px; border-radius: 8px; border: 1px solid #475569; background: #0f172a; color: #e2e8f0; font-size: 0.95rem; }
     input:focus { outline: none; border-color: #38bdf8; }
-    button { padding: 12px 20px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; font-size: 0.95rem; }
+    button { padding: 12px 18px; border-radius: 8px; border: none; cursor: pointer; font-weight: 600; font-size: 0.9rem; }
     .btn-add { background: #22c55e; color: #fff; }
     .btn-add:hover { background: #16a34a; }
-    .btn-del { background: #ef4444; color: #fff; padding: 6px 12px; font-size: 0.85rem; }
+    .btn-del { background: #ef4444; color: #fff; padding: 6px 12px; font-size: 0.8rem; }
     .btn-del:hover { background: #dc2626; }
+    .btn-test { background: #8b5cf6; color: #fff; }
+    .btn-test:hover { background: #7c3aed; }
+    .btn-refresh { background: #0ea5e9; color: #fff; padding: 6px 12px; font-size: 0.8rem; }
     table { width: 100%; border-collapse: collapse; }
-    th, td { text-align: left; padding: 12px 10px; border-bottom: 1px solid #334155; font-size: 0.9rem; }
+    th, td { text-align: left; padding: 12px 8px; border-bottom: 1px solid #334155; font-size: 0.88rem; }
     th { color: #94a3b8; font-weight: 500; }
-    .status { padding: 4px 10px; border-radius: 20px; font-size: 0.8rem; font-weight: 600; }
+    .status { padding: 4px 10px; border-radius: 20px; font-size: 0.78rem; font-weight: 600; }
     .in-stock { background: #166534; color: #bbf7d0; }
     .out-stock { background: #7f1d1d; color: #fecaca; }
     .unknown { background: #334155; color: #94a3b8; }
-    .url { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #38bdf8; }
+    .pending { background: #854d0e; color: #fef08a; }
+    .url { max-width: 200px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .url a { color: #38bdf8; text-decoration: none; }
     .empty { text-align: center; color: #64748b; padding: 40px 0; }
-    .info { background: #1e3a5f; border: 1px solid #1e40af; color: #93c5fd; padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 0.9rem; }
+    .info { background: #1e3a5f; border: 1px solid #1e40af; color: #93c5fd; padding: 12px 16px; border-radius: 8px; margin-bottom: 18px; font-size: 0.9rem; }
+    .top-actions { display: flex; gap: 10px; margin-bottom: 16px; flex-wrap: wrap; }
   </style>
 </head>
 <body>
@@ -198,7 +216,11 @@ DASHBOARD_HTML = """
     <p class="sub">Multiple products • Per-product pincode • Auto Telegram alert • Check every {{ interval }}s</p>
 
     <div class="info">
-      💡 Add product links below. Jab bhi koi product aapke pincode pe stock mein aayega, Telegram pe notification aa jayega.
+      💡 Product add karte hi turant check hota hai. Stock aaye toh Telegram notification aayega.
+    </div>
+
+    <div class="top-actions">
+      <button class="btn-test" onclick="testNotification()">🔔 Test Telegram Notification</button>
     </div>
 
     <div class="card">
@@ -237,24 +259,29 @@ DASHBOARD_HTML = """
           <th>Pincode</th>
           <th>Status</th>
           <th>Last Checked</th>
-          <th></th>
+          <th>Actions</th>
         </tr></thead><tbody>`;
 
       data.forEach(p => {
-        let statusClass = 'unknown';
+        let statusClass = 'pending';
         let statusText = p.last_status || 'PENDING';
         if (statusText === 'IN_STOCK') { statusClass = 'in-stock'; statusText = 'IN STOCK'; }
-        if (statusText === 'OUT_OF_STOCK') { statusClass = 'out-stock'; statusText = 'OUT OF STOCK'; }
+        else if (statusText === 'OUT_OF_STOCK') { statusClass = 'out-stock'; statusText = 'OUT OF STOCK'; }
+        else if (statusText === 'UNKNOWN') { statusClass = 'unknown'; statusText = 'UNKNOWN'; }
+        else { statusClass = 'pending'; statusText = 'PENDING'; }
 
         html += `<tr>
           <td>
-            <div style="font-weight:500;margin-bottom:4px;">${p.title || 'Loading...'}</div>
-            <div class="url"><a href="${p.url}" target="_blank" style="color:#38bdf8;">${p.url}</a></div>
+            <div style="font-weight:500;margin-bottom:4px;">${p.title || 'Checking...'}</div>
+            <div class="url"><a href="${p.url}" target="_blank">${p.url}</a></div>
           </td>
           <td>${p.pincode}</td>
           <td><span class="status ${statusClass}">${statusText}</span></td>
-          <td style="color:#94a3b8;font-size:0.85rem;">${p.last_checked || '-'}</td>
-          <td><button class="btn-del" onclick="deleteProduct('${p.id}')">Delete</button></td>
+          <td style="color:#94a3b8;font-size:0.82rem;">${p.last_checked || '-'}</td>
+          <td>
+            <button class="btn-refresh" onclick="refreshProduct('${p.id}')">Refresh</button>
+            <button class="btn-del" onclick="deleteProduct('${p.id}')">Delete</button>
+          </td>
         </tr>`;
       });
 
@@ -277,6 +304,9 @@ DASHBOARD_HTML = """
         document.getElementById('url').value = '';
         document.getElementById('pincode').value = '';
         loadProducts();
+        // status update hone ke liye thoda wait
+        setTimeout(loadProducts, 4000);
+        setTimeout(loadProducts, 8000);
       } else {
         const err = await res.json();
         alert(err.error || 'Error adding product');
@@ -289,8 +319,24 @@ DASHBOARD_HTML = """
       loadProducts();
     }
 
+    async function refreshProduct(id) {
+      await fetch('/api/products/' + id + '/refresh', { method: 'POST' });
+      setTimeout(loadProducts, 3000);
+      setTimeout(loadProducts, 6000);
+    }
+
+    async function testNotification() {
+      const res = await fetch('/api/test-telegram', { method: 'POST' });
+      const data = await res.json();
+      if (data.success) {
+        alert('✅ Test notification bhej diya gaya! Telegram check karo.');
+      } else {
+        alert('❌ Failed: ' + (data.error || 'Check TELEGRAM_BOT_TOKEN & CHAT_ID'));
+      }
+    }
+
     loadProducts();
-    setInterval(loadProducts, 15000);  // refresh every 15s
+    setInterval(loadProducts, 12000);
   </script>
 </body>
 </html>
@@ -324,7 +370,7 @@ def add_product():
     url = (data.get("url") or "").strip()
     pincode = (data.get("pincode") or "").strip()
 
-    if not url or "flipkart.com" not in url:
+    if not url or "flipkart.com" not in url.lower():
         return jsonify({"error": "Valid Flipkart URL required"}), 400
     if not pincode.isdigit() or len(pincode) != 6:
         return jsonify({"error": "Valid 6-digit pincode required"}), 400
@@ -343,6 +389,9 @@ def add_product():
         products.append(item)
         save_products()
 
+    # Turant background mein check start karo
+    threading.Thread(target=update_product_status, args=(new_id,), daemon=True).start()
+
     return jsonify({"success": True, "id": new_id})
 
 
@@ -353,6 +402,24 @@ def delete_product(pid):
         products = [p for p in products if p["id"] != pid]
         save_products()
     return jsonify({"success": True})
+
+
+@app.route("/api/products/<pid>/refresh", methods=["POST"])
+def refresh_product(pid):
+    threading.Thread(target=update_product_status, args=(pid,), daemon=True).start()
+    return jsonify({"success": True})
+
+
+@app.route("/api/test-telegram", methods=["POST"])
+def test_telegram():
+    ok = send_telegram(
+        "🔔 <b>Test Notification</b>\n\n"
+        "Flipkart Stock Dashboard sahi se kaam kar raha hai!\n"
+        "Agar yeh message aa gaya toh Telegram setup perfect hai ✅"
+    )
+    if ok:
+        return jsonify({"success": True})
+    return jsonify({"success": False, "error": "Telegram send failed. Check TOKEN & CHAT_ID"}), 400
 
 
 # ================== START ==================
