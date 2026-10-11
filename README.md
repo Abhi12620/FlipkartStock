@@ -1,78 +1,72 @@
-# Flipkart Stock Notifier Bot
+# Flipkart Multi-Product Stock Dashboard
 
-Simple bot that checks Flipkart product availability for your pincode and sends Telegram notification when stock comes.
+Versatile dashboard to track **multiple Flipkart products** with individual pincodes.
 
-**Product pre-filled:** ASUS ExpertBook P3 (from your short link)
-
----
-
-## 1. Telegram Bot Setup (2 minutes)
-
-1. Open Telegram → search **@BotFather**
-2. Send `/newbot` → give name & username
-3. Copy the **token** (looks like `123456:ABC...`)
-4. Search **@userinfobot** → start → copy your **Chat ID** (number)
+### Features
+- Beautiful web dashboard
+- Add / Delete multiple product links
+- Separate pincode for each product
+- Automatic Telegram notification when stock arrives
+- Check every **100 seconds**
+- Works 24/7 on Render free tier + UptimeRobot
 
 ---
 
-## 2. Local Test (optional)
+## 1. Telegram Setup
 
-```bash
-pip install -r requirements.txt
-cp .env.example .env
-# Edit .env and put your TELEGRAM_BOT_TOKEN + TELEGRAM_CHAT_ID + PINCODE
-python app.py
-```
+1. Telegram → **@BotFather** → `/newbot` → copy **Token**
+2. Telegram → **@userinfobot** → start → copy **Chat ID**
 
 ---
 
-## 3. Deploy on Render (Free + 24/7)
+## 2. Deploy on Render
 
-1. Create a new GitHub repository and upload these files:
+1. Upload these files to a new GitHub repo:
    - `app.py`
    - `requirements.txt`
-   - `.env.example` (optional)
+   - `README.md`
 
-2. Go to [render.com](https://render.com) → **New** → **Web Service**
+2. Go to [render.com](https://render.com) → **New Web Service**
 
-3. Connect your GitHub repo
+3. Connect GitHub repo
 
 4. Settings:
-   - **Runtime**: Python 3
    - **Build Command**: `pip install -r requirements.txt`
    - **Start Command**: `gunicorn app:app`
-   - **Instance Type**: Free
+   - **Instance**: Free
 
-5. **Environment Variables** (add these):
+5. **Environment Variables** add karo:
    ```
-   PRODUCT_URL = https://www.flipkart.com/asus-expertbook-p3-ai-pc-ir-cam-1-yr-adp-intel-core-ultra-5-225h-16-gb-512-gb-ssd-windows-11-home-p3606ccap-mb0062ws-p3606ccap-mb0431ws-thin-light-laptop/p/itm2cc2f9b61c169?pid=COMHM9URRSHWXPKY
-   PINCODE = your_pincode_here
    TELEGRAM_BOT_TOKEN = your_bot_token
-   TELEGRAM_CHAT_ID = your_chat_id
-   CHECK_INTERVAL = 180
+   TELEGRAM_CHAT_ID   = your_chat_id
+   CHECK_INTERVAL     = 100
    ```
 
-6. Click **Deploy**
+6. Deploy
 
 ---
 
-## 4. Keep it Alive (UptimeRobot)
+## 3. Keep Alive (UptimeRobot)
 
-Render free tier sleeps after 15 min of no traffic.
+1. [uptimerobot.com](https://uptimerobot.com) → free account
+2. Add Monitor → HTTP(s)
+3. URL: `https://your-app.onrender.com/health`
+4. Interval: **5 minutes**
 
-1. Go to [uptimerobot.com](https://uptimerobot.com) → free account
-2. **Add New Monitor**
-   - Monitor Type: **HTTP(s)**
-   - URL: `https://your-app-name.onrender.com/health`
-   - Interval: **5 minutes**
-3. Create Monitor
+---
 
-Done! Ab PC bandh hone pe bhi bot chalega.
+## 4. How to Use
+
+1. Open your Render URL in browser (e.g. `https://your-app.onrender.com`)
+2. Dashboard khulega
+3. Product URL + Pincode daalo → **Add Product**
+4. Multiple products add kar sakte ho
+5. Jaise hi kisi ka stock aayega → Telegram pe message aa jayega
 
 ---
 
 ## Notes
 
-- Flipkart page structure change ho sakta hai. Agar kabhi detection fail ho toh bata dena.
-- CHECK_INTERVAL 120-300 seconds recommended (bahut aggressive mat rakho).
-- Personal use only.
+- Products list `products.json` mein save hoti hai (redeploy pe reset ho sakti hai)
+- Flipkart page structure change ho sakta hai – detection fail ho toh bata dena
+- Personal use only
