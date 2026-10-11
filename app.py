@@ -94,36 +94,35 @@ def check_single_product(url: str, pincode: str):
                 title = tag.get_text(strip=True)[:80]
                 break
 
-        # 1. Explicit out-of-stock / not deliverable signals (highest priority)
-        out_signals = [
-            "NOTIFY ME", "NOTIFYME",
-            "CURRENTLY UNAVAILABLE", "OUT OF STOCK",
-            "NOT DELIVERABLE AT YOUR LOCATION",
-            "NOT DELIVERABLE",
-            "DOES NOT DELIVER TO YOUR LOCATION",
-            "UNAVAILABLE AT THIS PINCODE",
-            "NOT SERVICEABLE",
-            "DELIVERY NOT AVAILABLE",
-        ]
-        for signal in out_signals:
-            if signal in page_text:
-                return False, title
+        # ----- Detection logic (order matters) -----
 
-        # 2. In-stock signals
-        if any(x in page_text for x in ["ADD TO CART", "BUY NOW", "ADDTOCART", "BUYNOW"]):
-            # Double-check: agar "Change Address" ke saath "Not deliverable" type text ho to out of stock
-            if "CHANGE ADDRESS" in page_text and ("NOT DELIVERABLE" in page_text or "NOT SERVICEABLE" in page_text):
-                return False, title
+        # 1. Strong OUT OF STOCK signals
+        if "NOTIFY ME" in page_text or "NOTIFYME" in page_text:
+            return False, title
+        if "CURRENTLY UNAVAILABLE" in page_text or "OUT OF STOCK" in page_text:
+            return False, title
+
+        # 2. Clear pincode not-deliverable (only exact phrases)
+        if "NOT DELIVERABLE AT YOUR LOCATION" in page_text:
+            return False, title
+        if "DOES NOT DELIVER TO YOUR LOCATION" in page_text:
+            return False, title
+
+        # 3. Strong IN STOCK signals
+        if "BUY NOW" in page_text or "BUYNOW" in page_text:
+            return True, title
+        if "ADD TO CART" in page_text or "ADDTOCART" in page_text:
             return True, title
 
-        # 3. Button text fallback
-        for btn in soup.find_all("button"):
-            txt = btn.get_text(strip=True).upper()
-            if "NOTIFY" in txt:
+        # 4. Button text fallback
+        for btn in soup.find_all(["button", "div"]):
+            txt = (btn.get_text(strip=True) or "").upper()
+            if txt in ("NOTIFY ME", "NOTIFYME"):
                 return False, title
-            if "ADD TO CART" in txt or "BUY NOW" in txt:
+            if txt in ("BUY NOW", "ADD TO CART", "BUY WITH EMI"):
                 return True, title
 
+        # Default safer
         return False, title
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
