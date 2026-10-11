@@ -516,9 +516,21 @@ def test_telegram():
 
 
 # ================== START ==================
-if __name__ == "__main__":
+_started = False
+
+
+def start_background():
+    """gunicorn pe bhi chalega (pehle sirf __main__ mein chalta tha)."""
+    global _started
+    if _started:
+        return
+    _started = True
     load_products()
-    t = threading.Thread(target=background_checker, daemon=True)
-    t.start()
+    threading.Thread(target=background_checker, daemon=True).start()
+
+
+start_background()
+
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
