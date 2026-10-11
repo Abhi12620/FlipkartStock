@@ -179,13 +179,21 @@ SECTION_HEADS = {
 OFFER_AMT_RE = re.compile(
     r"^(₹\s?[\d,]+(\.\d+)?|\d{1,2}(\.\d+)?\s?%)\s*(off\b|cashback\b|/\s?m(o|onth)?\b|per month\b)", re.I)
 STRONG_CARD = re.compile(
-    r"(CREDIT|DEBIT)\s+CARD|BANK|FINANCE|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|PNB|CITI|RBL|YES\b|ONECARD|BAJAJ|SLICE|UPI|WALLET|PAYTM|PHONEPE", re.I)
+    r"(CREDIT|DEBIT)\s+CARD|BANK|FINANCE|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|PNB|CITI|RBL|YES\b|ONECARD|BAJAJ|SLICE|UPI|WALLET|PAYTM|PHONEPE|CARDLESS|LAZYPAY|ZESTMONEY|SIMPL|PAY LATER|NO COST EMI", re.I)
 JUNK_TXT = {"APPLY", "VIEW ALL", "VIEW ALL OFFERS", "T&C", "TERMS & CONDITIONS", "KNOW MORE"}
+
+
+ENUM_WORDS = {"TEXT", "IMAGE", "ICON", "BUTTON", "LINK", "TRUE", "FALSE", "NULL", "NONE", "DEFAULT",
+              "VALUE", "ACTION", "CONTENT", "TITLE", "SUBTITLE", "HEADER", "FOOTER", "RICH_TEXT"}
+ENUM_RE = re.compile(r"^[A-Za-z]+(Details|Content|Widget|Component|Renderable|Value|Type|Data|Info|Text)$|^[A-Z]+_[A-Z_]+$")
+CARD_NAME_RE = re.compile(r"((?:[A-Z][\w&.\-]*\s+){0,3}(?:Credit|Debit)\s+Cards?)")
 
 
 def _is_junk(s):
     su = s.upper()
     if su in JUNK_TXT or su.startswith("T&C") or su.startswith("HTTP"):
+        return True
+    if su in ENUM_WORDS or ENUM_RE.match(s):                 # 'ContentDetails', 'TEXT'
         return True
     if " " not in s and (len(s) > 25 or "_" in s):          # IDs jaise 13.ATLAS_PRODUCT...
         return True
@@ -199,16 +207,49 @@ def _amount_ok(s):
     return bool(m) and float(m.group(0).replace(",", "") or 0) > 0   # '₹0 off' hatao
 
 
+def _rupees(s):
+    return [int(x.replace(",", "")) for x in re.findall(r"₹\s?([\d,]+)", s)]
+
+
 def _make_offer(sec, strings):
     amt = next(s for s in strings if _amount_ok(s))
     star = any(s.upper() == "BEST VALUE FOR YOU" for s in strings)
-    rest = [s for s in strings if s is not amt and s.upper() != "BEST VALUE FOR YOU"
-            and s.upper() not in SECTION_HEADS and not _is_junk(s)]
-    text = ("⭐ " if star else "") + amt + (" — " + " | ".join(rest[:3]) if rest else "")
-    return {"sec": sec or "Offers", "text": text[:200]}
+
+    # total discount: "₹3,074 cashback + ₹4,510 instant discount" -> 7,584
+    total = None
+    if re.search(r"cashback|off|discount", amt, re.I) and not re.search(r"/\s?m", amt, re.I):
+        nums = _rupees(amt)
+        if nums:
+            total = sum(nums) if "+" in amt else nums[0]
+
+    short = [s for s in strings if s is not amt and not _is_junk(s) and s.upper() != "BEST VALUE FOR YOU"
+             and s.upper() not in SECTION_HEADS and not _amount_ok(s)]
+    extra = next((s for s in short if "•" in s), "")
+    card = next((s for s in short if "•" not in s and len(s) <= 40 and STRONG_CARD.search(s)), "")
+    if not card:                                   # naam lambe text (T&C) ke andar ho sakta hai
+        for s in strings:
+            m = CARD_NAME_RE.search(s)
+            if m:
+                card = m.group(1).strip()
+                break
+    if not card and short:
+        card = short[0]
+
+    if total:
+        body = f"₹{total:,} off"
+        detail = "" if amt.lower().replace(" ", "") == body.lower().replace(" ", "") else f" ({amt})"
+        text = f"{'⭐ ' if star else ''}{card or 'Card offer'}: {body}{detail}"
+    else:
+        text = f"{'⭐ ' if star else ''}{card or 'Offer'}: {amt}"
+    if extra:
+        text += f" | {extra}"
+    o = {"sec": sec or "Offers", "text": text[:220]}
+    if total:
+        o["total"] = total
+    return o
 
 
-def card_offers_tree(root):
+def card_offers_tree(root, debug=None):
     """Rome JSON ko STRUCTURE se padho: ek card = aisa sabse bada node jisme sirf ek amount ho.
     Flat string pairing se garbage aata tha."""
     cache = {}
@@ -252,6 +293,8 @@ def card_offers_tree(root):
                         if h:
                             state["sec"] = h
                     o = _make_offer(state["sec"], ss)
+                    if debug is not None and len(debug) < 12:
+                        debug.append(ss)
                     if o["text"].lower() not in [x["text"].lower() for x in offers]:
                         offers.append(o)
                     return
@@ -298,8 +341,7 @@ def special_lines(raw):
             joined = (t + " " + " ".join(nxt)).upper()
             if "NOT AVAILABLE" in joined:
                 out.append({"sec": "Exchange", "text": "Not available at this pincode"})
-            elif nxt:
-                out.append({"sec": "Exchange", "text": " ".join(nxt[:2])})
+            # exchange value tumhare purane device pe depend karti hai -> skip
         elif tu.startswith("BUY AT ₹"):
             nxt = raw[i + 1].strip() if i + 1 < len(raw) else ""
             out.append({"sec": "Deal", "text": t.strip() + (" | " + nxt if nxt.upper().startswith("EMI") else "")})
@@ -334,15 +376,24 @@ def extract_details(raw_texts, price_from_ld, rome_json=None, rome_raw=None):
                 break
     disc = f"{round((mrp - price) / mrp * 100)}%OFF" if (mrp and price) else None
 
-    offers = card_offers_tree(rome_json) if rome_json is not None else []
+    raw_cards = []
+    offers = card_offers_tree(rome_json, raw_cards) if rome_json is not None else []
     if not offers:
         offers = card_offers(raw_texts)
+    if price:
+        for o in offers:
+            if o.get("total") and o["sec"] == "Bank offers" and o["total"] < price:
+                o["text"] += f"  → ₹{price - o['total']:,}"
+    bank = [o for o in offers if o.get("total")]
+    if bank:
+        best = max(bank, key=lambda o: o["total"])
+        offers.insert(0, {"sec": "Best card offer", "text": best["text"].replace("⭐ ", "")})
     seen = set()
     for o in special_lines(raw_texts) + special_lines(rome_raw or []):
         if o["sec"] not in seen:                 # exchange/deal ek hi baar
             seen.add(o["sec"])
             offers.append(o)
-    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:30]}
+    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:30], "_raw_cards": raw_cards}
 
 
 def decide2(h_up, r_up):
@@ -572,6 +623,12 @@ def ensure_checker():
         th = threading.Thread(target=background_checker, daemon=True)
         checker_state["thread"] = th
         th.start()
+
+
+@app.after_request
+def _no_cache(resp):
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 @app.before_request
