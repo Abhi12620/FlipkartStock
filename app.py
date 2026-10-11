@@ -232,24 +232,55 @@ def update_product_status(product_id: str):
                     print(f"[{now}] ❌ OUT OF STOCK → {title[:50]} ({reason})")
                 else:
                     item["last_status"] = "UNKNOWN"
+                    print(f"[{now}] ❓ UNKNOWN → {title[:50]} ({reason})", flush=True)
                 break
         save_products()
 
 
+checker_state = {"thread": None, "started": None, "last_loop": None, "loops": 0}
+
+
+def _now():
+    return datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
+
+
 def background_checker():
-    print(f"🚀 Multi-product checker started (interval: {CHECK_INTERVAL}s)")
+    checker_state["started"] = _now()
+    print(f"🚀 Multi-product checker started (interval: {CHECK_INTERVAL}s)", flush=True)
     while True:
-        with lock:
-            current_list = list(products)
+        try:
+            with lock:
+                current_list = list(products)
 
-        for p in current_list:
-            try:
-                update_product_status(p["id"])
-            except Exception as e:
-                print("Item check error:", e)
-            time.sleep(2)
+            for p in current_list:
+                # har check alag thread mein, 90s se zyada atke to aage badho
+                t = threading.Thread(target=update_product_status, args=(p["id"],), daemon=True)
+                t.start()
+                t.join(90)
+                if t.is_alive():
+                    print(f"⏱ check timeout (90s): {p['id']}", flush=True)
+                time.sleep(2)
 
+            checker_state["loops"] += 1
+            checker_state["last_loop"] = _now()
+            print(f"🔁 loop #{checker_state['loops']} done | {len(current_list)} products | next in {CHECK_INTERVAL}s", flush=True)
+        except Exception as e:
+            print("Checker loop error:", e, flush=True)
         time.sleep(CHECK_INTERVAL)
+
+
+def ensure_checker():
+    """Thread mara ho ya start hi na hua ho to dobara chalu."""
+    th = checker_state["thread"]
+    if th is None or not th.is_alive():
+        th = threading.Thread(target=background_checker, daemon=True)
+        checker_state["thread"] = th
+        th.start()
+
+
+@app.before_request
+def _watchdog():
+    ensure_checker()   # UptimeRobot ke har ping pe bhi check hota hai
 
 
 # ================== DASHBOARD HTML ==================
@@ -437,7 +468,12 @@ def health():
     return jsonify({
         "status": "running",
         "products_count": len(products),
-        "check_interval_sec": CHECK_INTERVAL
+        "check_interval_sec": CHECK_INTERVAL,
+        "checker_alive": bool(checker_state["thread"] and checker_state["thread"].is_alive()),
+        "checker_started": checker_state["started"],
+        "checker_last_loop": checker_state["last_loop"],
+        "checker_loops": checker_state["loops"],
+        "server_time_ist": _now()
     })
 
 
@@ -526,7 +562,7 @@ def start_background():
         return
     _started = True
     load_products()
-    threading.Thread(target=background_checker, daemon=True).start()
+    ensure_checker()
 
 
 start_background()
