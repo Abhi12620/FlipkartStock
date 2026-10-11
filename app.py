@@ -19,6 +19,7 @@ app = Flask(__name__)
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", "100"))  # 100 seconds
+ALERT_REPEAT_SEC = int(os.getenv("ALERT_REPEAT_SEC", "0"))  # 0 = stock rehne tak har check pe alert
 PRODUCTS_FILE = "products.json"
 # ============================================
 
@@ -93,12 +94,13 @@ def decide(texts):
 
 
 def html_texts(soup):
+    """Visible strings, ORIGINAL case (scripts/styles hata ke)."""
     for tag in soup(["script", "style", "noscript", "template", "svg"]):
         tag.decompose()          # scripts ke andar ke 'notify me' etc. ignore
     out = []
     for s in soup.stripped_strings:
-        s = s.strip().upper()
-        if 0 < len(s) <= 120:
+        s = s.strip()
+        if 0 < len(s) <= 200:
             out.append(s)
     return out
 
@@ -119,6 +121,70 @@ def json_texts(o, out=None):
     return out
 
 
+
+OFFER_LABELS = ("BANK OFFER", "SPECIAL PRICE", "PARTNER OFFER", "COMBO OFFER", "NO COST EMI", "CASHBACK")
+PRICE_RE = re.compile(r"^₹\s?[\d,]+(\.\d+)?$")
+DISC_RE = re.compile(r"^\d{1,2}%\s*OFF$", re.I)
+
+
+def ld_price(soup):
+    """JSON-LD (schema.org) se price - sabse reliable, scripts hatane se pehle call karo."""
+    for sc in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(sc.string or "")
+        except Exception:
+            continue
+        for d in (data if isinstance(data, list) else [data]):
+            offers = d.get("offers") if isinstance(d, dict) else None
+            if isinstance(offers, list):
+                offers = offers[0] if offers else None
+            if isinstance(offers, dict) and offers.get("price"):
+                try:
+                    return int(float(str(offers["price"]).replace(",", "")))
+                except Exception:
+                    pass
+    return None
+
+
+def extract_details(raw_texts, price_from_ld):
+    """raw_texts = visible strings (original case). Price, MRP, discount, card offers."""
+    price = mrp = disc = None
+    prices = []
+    for t in raw_texts[:400]:
+        if PRICE_RE.match(t):
+            prices.append(int(re.sub(r"[^\d]", "", t.split(".")[0])))
+        elif disc is None and DISC_RE.match(t):
+            disc = t.upper().replace(" ", "")
+    if prices:
+        price = price_from_ld or prices[0]
+        bigger = [p for p in prices[1:4] if p > price]
+        mrp = bigger[0] if bigger else None
+    else:
+        price = price_from_ld
+
+    offers = []
+    i = 0
+    while i < len(raw_texts):
+        t = raw_texts[i]
+        tu = t.upper()
+        line = None
+        if tu in OFFER_LABELS and i + 1 < len(raw_texts):
+            line = f"{t}: {raw_texts[i + 1]}"
+            i += 1
+        elif any(tu.startswith(l) for l in OFFER_LABELS) and len(t) > 15:
+            line = t
+        elif "CARD" in tu and ("₹" in t or "%" in t) and any(k in tu for k in ("OFF", "CASHBACK", "DISCOUNT", "EMI")):
+            line = t
+        if line:
+            line = re.sub(r"\s*T&C\s*$", "", line).strip()[:160]
+            if line not in offers:
+                offers.append(line)
+        i += 1
+        if len(offers) >= 10:
+            break
+    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers}
+
+
 def check_single_product(url: str, pincode: str):
     """Returns (in_stock: bool|None, title: str, reason: str).
     None = pata nahi chala (blocked / no signal) -> OUT OF STOCK nahi maanenge."""
@@ -135,7 +201,7 @@ def check_single_product(url: str, pincode: str):
         # 1) warm-up: cookies lene ke liye
         r0 = s.get(url, timeout=15, allow_redirects=True)
         if r0.status_code in (403, 429, 529) or r0.status_code >= 500:
-            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r0.status_code})"
+            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r0.status_code})", {}
 
         # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware result
         rome_decision, rome_reason = None, "rome: no response"
@@ -147,7 +213,7 @@ def check_single_product(url: str, pincode: str):
                 "isReloadRequest": True,
                 "pageContext": {"fetchSeoData": True, "pageNumber": 1},
             }
-            rh = {**headers, "Content-Type": "application/json",
+            rh = {**headers, "Accept": "*/*", "Content-Type": "application/json",
                   "X-user-agent": UA + " FKUA/website/42/website/Desktop",
                   "Origin": "https://www.flipkart.com"}
             rr = s.post("https://2.rome.api.flipkart.com/api/4/page/fetch",
@@ -163,7 +229,7 @@ def check_single_product(url: str, pincode: str):
         # 3) page HTML (title + fallback)
         r = s.get(url, timeout=18, allow_redirects=True)
         if r.status_code in (403, 429, 529) or r.status_code >= 500:
-            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r.status_code})"
+            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r.status_code})", {}
         html = r.text
         soup = BeautifulSoup(html, "html.parser")
 
@@ -179,18 +245,40 @@ def check_single_product(url: str, pincode: str):
             if m:
                 title = m.group(1)[:80]
 
-        if rome_decision is not None:
-            return rome_decision, title, rome_reason
+        ldp = ld_price(soup)                      # scripts hatane se pehle
+        raw = html_texts(soup)
+        details = extract_details(raw, ldp)
+        upper = [t.upper() for t in raw if len(t) <= 120]
 
-        texts = html_texts(soup)
-        if len(texts) < 20:
-            return None, title, f"page khali/captcha lag raha hai ({rome_reason})"
-        h_decision, h_reason = decide(texts)
-        return h_decision, title, f"html (pincode apply nahi hua ho sakta): {h_reason} | {rome_reason}"
+        if rome_decision is not None:
+            return rome_decision, title, rome_reason, details
+
+        if len(upper) < 20:
+            return None, title, f"page khali/captcha lag raha hai ({rome_reason})", details
+        h_decision, h_reason = decide(upper)
+        return h_decision, title, f"html (pincode apply nahi hua ho sakta): {h_reason} | {rome_reason}", details
 
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
-        return None, "Error fetching", f"error: {str(e)[:80]}"
+        return None, "Error fetching", f"error: {str(e)[:80]}", {}
+
+
+def fmt_price(item):
+    p = item.get("price")
+    if not p:
+        return "Price: -"
+    s = f"₹{p:,}"
+    if item.get("mrp"):
+        s += f" (MRP ₹{item['mrp']:,}"
+        s += f", {item['discount']})" if item.get("discount") else ")"
+    return s
+
+
+def fmt_offers(item):
+    offs = (item.get("offers") or [])[:5]
+    if not offs:
+        return ""
+    return "🏷 <b>Offers</b>\n" + "\n".join("• " + o.replace("<", "").replace(">", "") for o in offs) + "\n\n"
 
 
 def update_product_status(product_id: str):
@@ -204,7 +292,7 @@ def update_product_status(product_id: str):
         if not target:
             return
 
-    in_stock, title, reason = check_single_product(target["url"], target["pincode"])
+    in_stock, title, reason, details = check_single_product(target["url"], target["pincode"])
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
     with lock:
@@ -213,20 +301,32 @@ def update_product_status(product_id: str):
                 if title not in ("Error fetching", "Blocked"):
                     item["title"] = title
                 item["reason"] = reason
+                for k in ("price", "mrp", "discount"):
+                    if details.get(k):
+                        item[k] = details[k]
+                if details.get("offers"):
+                    item["offers"] = details["offers"]
                 item["last_checked"] = now
                 old_status = item.get("last_status")
 
                 if in_stock is True:
                     item["last_status"] = "IN_STOCK"
-                    print(f"[{now}] ✅ IN STOCK → {title[:50]} ({reason})")
-                    if old_status != "IN_STOCK":
+                    print(f"[{now}] ✅ IN STOCK → {title[:50]} ({reason})", flush=True)
+                    now_ts = time.time()
+                    first = old_status != "IN_STOCK"
+                    due = (now_ts - item.get("last_alert_ts", 0)) >= ALERT_REPEAT_SEC
+                    if first or due:
+                        head = "🔥 <b>STOCK AVAILABLE!</b>" if first else "🔁 <b>STILL IN STOCK!</b>"
                         msg = (
-                            f"🔥 <b>STOCK AVAILABLE!</b>\n\n"
+                            f"{head}\n\n"
                             f"<b>{title}</b>\n\n"
+                            f"💰 {fmt_price(item)}\n"
+                            f"{fmt_offers(item)}"
                             f"📍 Pincode: {item['pincode']}\n"
                             f"🔗 <a href='{item['url']}'>Open Product</a>"
                         )
-                        send_telegram(msg)
+                        if send_telegram(msg):
+                            item["last_alert_ts"] = now_ts
                 elif in_stock is False:
                     item["last_status"] = "OUT_OF_STOCK"
                     print(f"[{now}] ❌ OUT OF STOCK → {title[:50]} ({reason})")
@@ -387,6 +487,11 @@ DASHBOARD_HTML = """
         html += `<tr>
           <td>
             <div style="font-weight:500;margin-bottom:4px;">${p.title || 'Checking...'}</div>
+            ${p.price ? `<div style="margin:2px 0 4px;"><span style="color:#4ade80;font-weight:700;font-size:1.05rem;">₹${Number(p.price).toLocaleString('en-IN')}</span>
+              ${p.mrp ? `<span style="color:#64748b;text-decoration:line-through;margin-left:8px;font-size:0.82rem;">₹${Number(p.mrp).toLocaleString('en-IN')}</span>` : ''}
+              ${p.discount ? `<span style="color:#fbbf24;margin-left:8px;font-size:0.82rem;">${p.discount}</span>` : ''}</div>` : ''}
+            ${(p.offers && p.offers.length) ? `<details style="margin:4px 0;font-size:0.78rem;color:#94a3b8;"><summary style="cursor:pointer;color:#38bdf8;">🏷 ${p.offers.length} offers</summary>
+              <ul style="margin:4px 0 0 16px;padding:0;">${p.offers.map(o => `<li style="margin-bottom:3px;">${o}</li>`).join('')}</ul></details>` : ''}
             <div class="url"><a href="${p.url}" target="_blank">${p.url}</a></div>
           </td>
           <td>${p.pincode}</td>
@@ -535,8 +640,8 @@ def debug_product(pid):
         t = next((p for p in products if p["id"] == pid), None)
     if not t:
         return jsonify({"error": "not found"}), 404
-    ins, title, reason = check_single_product(t["url"], t["pincode"])
-    return jsonify({"in_stock": ins, "title": title, "reason": reason})
+    ins, title, reason, details = check_single_product(t["url"], t["pincode"])
+    return jsonify({"in_stock": ins, "title": title, "reason": reason, "details": details})
 
 
 @app.route("/api/test-telegram", methods=["POST"])
