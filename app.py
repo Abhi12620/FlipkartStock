@@ -3,10 +3,12 @@ import json
 import time
 import threading
 import requests
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from flask import Flask, request, jsonify, render_template_string
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
+
+IST = timezone(timedelta(hours=5, minutes=30))
 
 load_dotenv()
 
@@ -92,13 +94,29 @@ def check_single_product(url: str, pincode: str):
                 title = tag.get_text(strip=True)[:80]
                 break
 
-        if "NOTIFY ME" in page_text or "NOTIFYME" in page_text:
-            return False, title
-        if any(x in page_text for x in ["ADD TO CART", "BUY NOW", "ADDTOCART", "BUYNOW"]):
-            return True, title
-        if "CURRENTLY UNAVAILABLE" in page_text or "OUT OF STOCK" in page_text:
-            return False, title
+        # 1. Explicit out-of-stock / not deliverable signals (highest priority)
+        out_signals = [
+            "NOTIFY ME", "NOTIFYME",
+            "CURRENTLY UNAVAILABLE", "OUT OF STOCK",
+            "NOT DELIVERABLE AT YOUR LOCATION",
+            "NOT DELIVERABLE",
+            "DOES NOT DELIVER TO YOUR LOCATION",
+            "UNAVAILABLE AT THIS PINCODE",
+            "NOT SERVICEABLE",
+            "DELIVERY NOT AVAILABLE",
+        ]
+        for signal in out_signals:
+            if signal in page_text:
+                return False, title
 
+        # 2. In-stock signals
+        if any(x in page_text for x in ["ADD TO CART", "BUY NOW", "ADDTOCART", "BUYNOW"]):
+            # Double-check: agar "Change Address" ke saath "Not deliverable" type text ho to out of stock
+            if "CHANGE ADDRESS" in page_text and ("NOT DELIVERABLE" in page_text or "NOT SERVICEABLE" in page_text):
+                return False, title
+            return True, title
+
+        # 3. Button text fallback
         for btn in soup.find_all("button"):
             txt = btn.get_text(strip=True).upper()
             if "NOTIFY" in txt:
@@ -124,7 +142,7 @@ def update_product_status(product_id: str):
             return
 
     in_stock, title = check_single_product(target["url"], target["pincode"])
-    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
     with lock:
         for item in products:
