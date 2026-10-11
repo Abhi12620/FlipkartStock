@@ -67,135 +67,130 @@ def send_telegram(message: str):
         return False
 
 
+# ---------- Detection helpers ----------
+LOC_OUT = ("NOT DELIVERABLE", "DOES NOT DELIVER", "NOT SERVICEABLE", "UNSERVICEABLE",
+           "CANNOT BE DELIVERED", "NOT AVAILABLE FOR DELIVERY")
+CTA_EXACT = {"ADD TO CART", "BUY NOW", "GO TO CART", "BUY WITH EMI"}
+OUT_EXACT = {"NOTIFY ME", "SOLD OUT", "COMING SOON", "OUT OF STOCK"}
+OUT_SUBSTR = ("CURRENTLY UNAVAILABLE", "CURRENTLY OUT OF STOCK", "OUT OF STOCK")
+
+UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+
+def decide(texts):
+    """texts = short VISIBLE strings (upper-case). Returns (True/False/None, reason)."""
+    for t in texts:
+        if any(k in t for k in LOC_OUT):
+            return False, f"not deliverable: '{t[:60]}'"
+    for t in texts:
+        if t in CTA_EXACT:
+            return True, f"button: '{t}'"
+    for t in texts:
+        if t in OUT_EXACT or any(k in t for k in OUT_SUBSTR):
+            return False, f"out signal: '{t[:60]}'"
+    return None, "no clear signal"
+
+
+def html_texts(soup):
+    for tag in soup(["script", "style", "noscript", "template", "svg"]):
+        tag.decompose()          # scripts ke andar ke 'notify me' etc. ignore
+    out = []
+    for s in soup.stripped_strings:
+        s = s.strip().upper()
+        if 0 < len(s) <= 120:
+            out.append(s)
+    return out
+
+
+def json_texts(o, out=None):
+    if out is None:
+        out = []
+    if isinstance(o, dict):
+        for v in o.values():
+            json_texts(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            json_texts(v, out)
+    elif isinstance(o, str):
+        s = o.strip().upper()
+        if 0 < len(s) <= 120:
+            out.append(s)
+    return out
+
+
 def check_single_product(url: str, pincode: str):
-    """Returns (in_stock: bool|None, title: str)"""
+    """Returns (in_stock: bool|None, title: str, reason: str).
+    None = pata nahi chala (blocked / no signal) -> OUT OF STOCK nahi maanenge."""
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "User-Agent": UA,
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
         "Referer": "https://www.flipkart.com/",
-        "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
-        "sec-ch-ua-mobile": "?0",
-        "sec-ch-ua-platform": '"Windows"',
     }
     try:
-        session = requests.Session()
-        session.headers.update(headers)
+        s = requests.Session()
+        s.headers.update(headers)
 
-        # Step 1: Try to set pincode via Flipkart location API (best effort)
+        # 1) warm-up: cookies lene ke liye
+        r0 = s.get(url, timeout=15, allow_redirects=True)
+        if r0.status_code in (403, 429, 529) or r0.status_code >= 500:
+            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r0.status_code})"
+
+        # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware result
+        rome_decision, rome_reason = None, "rome: no response"
         try:
-            loc_headers = {
-                **headers,
-                "Content-Type": "application/json",
-                "X-user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
-            }
-            # First fetch product to get session cookie
-            r0 = session.get(url, timeout=12, allow_redirects=True)
-            # Try rome API to set location context
-            rome_url = "https://1.rome.api.flipkart.com/api/4/page/fetch"
+            path = re.sub(r"^https?://[^/]+", "", r0.url)
             payload = {
-                "pageUri": url.replace("https://www.flipkart.com", ""),
-                "locationContext": {"pincode": str(pincode)},
-                "pageContext": {"pageNumber": 1, "fetchSeoData": True}
+                "pageUri": path,
+                "locationContext": {"pincode": str(pincode), "changed": True},
+                "isReloadRequest": True,
+                "pageContext": {"fetchSeoData": True, "pageNumber": 1},
             }
-            r_rome = session.post(rome_url, headers=loc_headers, json=payload, timeout=12)
-            if r_rome.status_code == 200:
-                j = r_rome.json()
-                # Try to extract availability from API response
-                raw = str(j).upper()
-                title = "Product"
-                # Try finding title in response
-                try:
-                    # common paths vary, just search text
-                    if "PRODUCT" in raw or "TITLE" in raw:
-                        pass
-                except Exception:
-                    pass
-
-                if "NOTIFY ME" in raw or "NOTIFYME" in raw:
-                    return False, title
-                if "NOT DELIVERABLE AT YOUR LOCATION" in raw:
-                    return False, title
-                if any(x in raw for x in ["BUY NOW", "ADD TO CART", "ADDTOCART", "BUYNOW", "IN_STOCK", "INSTOCK"]):
-                    # Try extract better title later
-                    pass
-                # Save SN cookie if present
-                if "SESSION" in j and isinstance(j.get("SESSION"), dict):
-                    sn = j["SESSION"].get("sn")
-                    if sn:
-                        session.cookies.set("SN", sn, domain=".flipkart.com")
+            rh = {**headers, "Content-Type": "application/json",
+                  "X-user-agent": UA + " FKUA/website/42/website/Desktop",
+                  "Origin": "https://www.flipkart.com"}
+            rr = s.post("https://2.rome.api.flipkart.com/api/4/page/fetch",
+                        headers=rh, json=payload, timeout=15)
+            if rr.status_code == 200:
+                rome_decision, rome_reason = decide(json_texts(rr.json()))
+                rome_reason = "rome: " + rome_reason
+            else:
+                rome_reason = f"rome: HTTP {rr.status_code}"
         except Exception as e:
-            print("Rome API skip:", e)
+            rome_reason = f"rome error: {str(e)[:60]}"
 
-        # Step 2: Normal page fetch with cookies
-        session.cookies.set("pincode", pincode, domain=".flipkart.com")
-        r = session.get(url, timeout=18, allow_redirects=True)
-        r.raise_for_status()
+        # 3) page HTML (title + fallback)
+        r = s.get(url, timeout=18, allow_redirects=True)
+        if r.status_code in (403, 429, 529) or r.status_code >= 500:
+            return None, "Blocked", f"Flipkart ne block kiya (HTTP {r.status_code})"
         html = r.text
-        page_text = html.upper()
         soup = BeautifulSoup(html, "html.parser")
 
-        # Title
         title = "Product"
-        for sel in [
-            ("span", {"class": "VU-ZEz"}),
-            ("h1", {}),
-            ("span", {"class": lambda c: c and "B_NuCI" in str(c)}),
-        ]:
+        for sel in (("span", {"class": "VU-ZEz"}), ("h1", {}),
+                    ("span", {"class": lambda c: c and "B_NuCI" in str(c)})):
             tag = soup.find(sel[0], sel[1])
             if tag and tag.get_text(strip=True):
                 title = tag.get_text(strip=True)[:80]
                 break
-
-        # Also try from JSON-LD or window data
         if title == "Product":
-            import re
             m = re.search(r'"name"\s*:\s*"([^"]{10,120})"', html)
             if m:
                 title = m.group(1)[:80]
 
-        # ----- Detection -----
-        # OUT signals
-        if "NOTIFY ME" in page_text or "NOTIFYME" in page_text:
-            return False, title
-        if "CURRENTLY UNAVAILABLE" in page_text:
-            return False, title
-        if "NOT DELIVERABLE AT YOUR LOCATION" in page_text:
-            return False, title
-        if "DOES NOT DELIVER TO YOUR LOCATION" in page_text:
-            return False, title
+        if rome_decision is not None:
+            return rome_decision, title, rome_reason
 
-        # IN signals (broader)
-        in_signals = [
-            "BUY NOW", "BUYNOW", "ADD TO CART", "ADDTOCART",
-            "BUY WITH EMI", "BUY WITH",
-            '"AVAILABLE":TRUE', '"INSTOCK":TRUE',
-            '"IN_STOCK"', "IN STOCK",
-        ]
-        for sig in in_signals:
-            if sig in page_text:
-                return True, title
+        texts = html_texts(soup)
+        if len(texts) < 20:
+            return None, title, f"page khali/captcha lag raha hai ({rome_reason})"
+        h_decision, h_reason = decide(texts)
+        return h_decision, title, f"html (pincode apply nahi hua ho sakta): {h_reason} | {rome_reason}"
 
-        # Button / div text
-        for el in soup.find_all(["button", "div", "span", "a"]):
-            txt = (el.get_text(strip=True) or "").upper()
-            if len(txt) > 30:
-                continue
-            if txt in ("NOTIFY ME", "NOTIFYME"):
-                return False, title
-            if any(x in txt for x in ("BUY NOW", "ADD TO CART", "BUY WITH EMI")):
-                return True, title
-
-        # Last resort: if price is clearly visible and no notify me → likely in stock
-        if "₹" in html and "NOTIFY ME" not in page_text:
-            # weak signal
-            if "DELIVERY BY" in page_text or "DELIVERY IN" in page_text:
-                return True, title
-
-        return False, title
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
-        return None, "Error fetching"
+        return None, "Error fetching", f"error: {str(e)[:80]}"
 
 
 def update_product_status(product_id: str):
@@ -209,19 +204,21 @@ def update_product_status(product_id: str):
         if not target:
             return
 
-    in_stock, title = check_single_product(target["url"], target["pincode"])
+    in_stock, title, reason = check_single_product(target["url"], target["pincode"])
     now = datetime.now(IST).strftime("%Y-%m-%d %H:%M:%S")
 
     with lock:
         for item in products:
             if item["id"] == product_id:
-                item["title"] = title
+                if title not in ("Error fetching", "Blocked"):
+                    item["title"] = title
+                item["reason"] = reason
                 item["last_checked"] = now
                 old_status = item.get("last_status")
 
                 if in_stock is True:
                     item["last_status"] = "IN_STOCK"
-                    print(f"[{now}] ✅ IN STOCK → {title[:50]}")
+                    print(f"[{now}] ✅ IN STOCK → {title[:50]} ({reason})")
                     if old_status != "IN_STOCK":
                         msg = (
                             f"🔥 <b>STOCK AVAILABLE!</b>\n\n"
@@ -232,7 +229,7 @@ def update_product_status(product_id: str):
                         send_telegram(msg)
                 elif in_stock is False:
                     item["last_status"] = "OUT_OF_STOCK"
-                    print(f"[{now}] ❌ OUT OF STOCK → {title[:50]}")
+                    print(f"[{now}] ❌ OUT OF STOCK → {title[:50]} ({reason})")
                 else:
                     item["last_status"] = "UNKNOWN"
                 break
@@ -362,7 +359,7 @@ DASHBOARD_HTML = """
             <div class="url"><a href="${p.url}" target="_blank">${p.url}</a></div>
           </td>
           <td>${p.pincode}</td>
-          <td><span class="status ${statusClass}">${statusText}</span></td>
+          <td><span class="status ${statusClass}">${statusText}</span><div style="color:#64748b;font-size:0.72rem;margin-top:4px;max-width:220px;">${p.reason || ''}</div></td>
           <td style="color:#94a3b8;font-size:0.82rem;">${p.last_checked || '-'}</td>
           <td>
             <button class="btn-refresh" onclick="refreshProduct('${p.id}')">Refresh</button>
@@ -494,6 +491,16 @@ def delete_product(pid):
 def refresh_product(pid):
     threading.Thread(target=update_product_status, args=(pid,), daemon=True).start()
     return jsonify({"success": True})
+
+
+@app.route("/api/debug/<pid>")
+def debug_product(pid):
+    with lock:
+        t = next((p for p in products if p["id"] == pid), None)
+    if not t:
+        return jsonify({"error": "not found"}), 404
+    ins, title, reason = check_single_product(t["url"], t["pincode"])
+    return jsonify({"in_stock": ins, "title": title, "reason": reason})
 
 
 @app.route("/api/test-telegram", methods=["POST"])
