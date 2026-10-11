@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import time
 import threading
@@ -70,19 +71,71 @@ def check_single_product(url: str, pincode: str):
     """Returns (in_stock: bool|None, title: str)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-IN,en;q=0.9",
         "Referer": "https://www.flipkart.com/",
+        "sec-ch-ua": '"Chromium";v="131", "Not_A Brand";v="24"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
     }
     try:
         session = requests.Session()
         session.headers.update(headers)
-        session.cookies.set("pincode", pincode, domain=".flipkart.com")
 
+        # Step 1: Try to set pincode via Flipkart location API (best effort)
+        try:
+            loc_headers = {
+                **headers,
+                "Content-Type": "application/json",
+                "X-user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 FKUA/website/42/website/Desktop",
+            }
+            # First fetch product to get session cookie
+            r0 = session.get(url, timeout=12, allow_redirects=True)
+            # Try rome API to set location context
+            rome_url = "https://1.rome.api.flipkart.com/api/4/page/fetch"
+            payload = {
+                "pageUri": url.replace("https://www.flipkart.com", ""),
+                "locationContext": {"pincode": str(pincode)},
+                "pageContext": {"pageNumber": 1, "fetchSeoData": True}
+            }
+            r_rome = session.post(rome_url, headers=loc_headers, json=payload, timeout=12)
+            if r_rome.status_code == 200:
+                j = r_rome.json()
+                # Try to extract availability from API response
+                raw = str(j).upper()
+                title = "Product"
+                # Try finding title in response
+                try:
+                    # common paths vary, just search text
+                    if "PRODUCT" in raw or "TITLE" in raw:
+                        pass
+                except Exception:
+                    pass
+
+                if "NOTIFY ME" in raw or "NOTIFYME" in raw:
+                    return False, title
+                if "NOT DELIVERABLE AT YOUR LOCATION" in raw:
+                    return False, title
+                if any(x in raw for x in ["BUY NOW", "ADD TO CART", "ADDTOCART", "BUYNOW", "IN_STOCK", "INSTOCK"]):
+                    # Try extract better title later
+                    pass
+                # Save SN cookie if present
+                if "SESSION" in j and isinstance(j.get("SESSION"), dict):
+                    sn = j["SESSION"].get("sn")
+                    if sn:
+                        session.cookies.set("SN", sn, domain=".flipkart.com")
+        except Exception as e:
+            print("Rome API skip:", e)
+
+        # Step 2: Normal page fetch with cookies
+        session.cookies.set("pincode", pincode, domain=".flipkart.com")
         r = session.get(url, timeout=18, allow_redirects=True)
         r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        page_text = r.text.upper()
+        html = r.text
+        page_text = html.upper()
+        soup = BeautifulSoup(html, "html.parser")
 
+        # Title
         title = "Product"
         for sel in [
             ("span", {"class": "VU-ZEz"}),
@@ -94,35 +147,51 @@ def check_single_product(url: str, pincode: str):
                 title = tag.get_text(strip=True)[:80]
                 break
 
-        # ----- Detection logic (order matters) -----
+        # Also try from JSON-LD or window data
+        if title == "Product":
+            import re
+            m = re.search(r'"name"\s*:\s*"([^"]{10,120})"', html)
+            if m:
+                title = m.group(1)[:80]
 
-        # 1. Strong OUT OF STOCK signals
+        # ----- Detection -----
+        # OUT signals
         if "NOTIFY ME" in page_text or "NOTIFYME" in page_text:
             return False, title
-        if "CURRENTLY UNAVAILABLE" in page_text or "OUT OF STOCK" in page_text:
+        if "CURRENTLY UNAVAILABLE" in page_text:
             return False, title
-
-        # 2. Clear pincode not-deliverable (only exact phrases)
         if "NOT DELIVERABLE AT YOUR LOCATION" in page_text:
             return False, title
         if "DOES NOT DELIVER TO YOUR LOCATION" in page_text:
             return False, title
 
-        # 3. Strong IN STOCK signals
-        if "BUY NOW" in page_text or "BUYNOW" in page_text:
-            return True, title
-        if "ADD TO CART" in page_text or "ADDTOCART" in page_text:
-            return True, title
-
-        # 4. Button text fallback
-        for btn in soup.find_all(["button", "div"]):
-            txt = (btn.get_text(strip=True) or "").upper()
-            if txt in ("NOTIFY ME", "NOTIFYME"):
-                return False, title
-            if txt in ("BUY NOW", "ADD TO CART", "BUY WITH EMI"):
+        # IN signals (broader)
+        in_signals = [
+            "BUY NOW", "BUYNOW", "ADD TO CART", "ADDTOCART",
+            "BUY WITH EMI", "BUY WITH",
+            '"AVAILABLE":TRUE', '"INSTOCK":TRUE',
+            '"IN_STOCK"', "IN STOCK",
+        ]
+        for sig in in_signals:
+            if sig in page_text:
                 return True, title
 
-        # Default safer
+        # Button / div text
+        for el in soup.find_all(["button", "div", "span", "a"]):
+            txt = (el.get_text(strip=True) or "").upper()
+            if len(txt) > 30:
+                continue
+            if txt in ("NOTIFY ME", "NOTIFYME"):
+                return False, title
+            if any(x in txt for x in ("BUY NOW", "ADD TO CART", "BUY WITH EMI")):
+                return True, title
+
+        # Last resort: if price is clearly visible and no notify me → likely in stock
+        if "₹" in html and "NOTIFY ME" not in page_text:
+            # weak signal
+            if "DELIVERY BY" in page_text or "DELIVERY IN" in page_text:
+                return True, title
+
         return False, title
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
