@@ -105,6 +105,23 @@ def html_texts(soup):
     return out
 
 
+def json_strings(o, out=None):
+    """JSON ke sab strings (original case, document order)."""
+    if out is None:
+        out = []
+    if isinstance(o, dict):
+        for v in o.values():
+            json_strings(v, out)
+    elif isinstance(o, list):
+        for v in o:
+            json_strings(v, out)
+    elif isinstance(o, str):
+        s = o.strip()
+        if 0 < len(s) <= 200:
+            out.append(s)
+    return out
+
+
 def json_texts(o, out=None):
     if out is None:
         out = []
@@ -122,7 +139,7 @@ def json_texts(o, out=None):
 
 
 
-OFFER_LABELS = ("BANK OFFER", "SPECIAL PRICE", "PARTNER OFFER", "COMBO OFFER", "NO COST EMI", "CASHBACK")
+OFFER_LABELS = ("BANK OFFER", "SPECIAL PRICE", "PARTNER OFFER", "COMBO OFFER")
 PRICE_RE = re.compile(r"^₹\s?[\d,]+(\.\d+)?$")
 DISC_RE = re.compile(r"^\d{1,2}%\s*OFF$", re.I)
 
@@ -146,43 +163,127 @@ def ld_price(soup):
     return None
 
 
-def extract_details(raw_texts, price_from_ld):
-    """raw_texts = visible strings (original case). Price, MRP, discount, card offers."""
-    price = mrp = disc = None
-    prices = []
-    for t in raw_texts[:400]:
-        if PRICE_RE.match(t):
-            prices.append(int(re.sub(r"[^\d]", "", t.split(".")[0])))
-        elif disc is None and DISC_RE.match(t):
-            disc = t.upper().replace(" ", "")
-    if prices:
-        price = price_from_ld or prices[0]
-        bigger = [p for p in prices[1:4] if p > price]
-        mrp = bigger[0] if bigger else None
-    else:
-        price = price_from_ld
+NUM_RE = re.compile(r"^₹?\s?(\d[\d,]*)$")
+AMT_RE = re.compile(r"^(₹\s?[\d,]+(\.\d+)?|\d{1,2}(\.\d+)?\s?%)\s*(off|cashback|instant discount|unlimited cashback)\b.*$", re.I)
+CARD_WORDS = re.compile(r"CARD|BANK|UPI|EMI|WALLET|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|BOB|PNB|CITI|RBL|YES BANK|ONECARD|PAYTM|PHONEPE|CRED\b", re.I)
+SKIP_TXT = {"APPLY", "VIEW ALL", "VIEW ALL OFFERS", "BEST VALUE FOR YOU", "BANK OFFERS", "T&C", "TERMS & CONDITIONS"}
+DELIV_RE = re.compile(r"^(DELIVERY|GET IT)\s+(BY|IN|ON)\b")
 
-    offers = []
+
+def card_offers(raw):
+    """'₹7,584 off' + 'Flipkart Axis Bank Credit Card' jaise pairs se bank/card offers."""
+    offers, cur = [], None
+
+    def flush():
+        nonlocal cur
+        if cur and cur["desc"]:
+            desc = " ".join(cur["desc"])
+            if CARD_WORDS.search(desc):
+                line = re.sub(r"\s*T&C\s*$", "", f"{cur['amt']} – {desc}").strip()[:170]
+                if line.lower() not in [o.lower() for o in offers]:
+                    offers.append(line)
+        cur = None
+
+    for t in raw:
+        t = t.strip()
+        tu = t.upper()
+        if AMT_RE.match(t) and len(t) < 110 and not tu.startswith("BUY"):
+            flush()
+            cur = {"amt": t, "desc": []}
+        elif cur is not None:
+            if tu in SKIP_TXT or tu in CTA_EXACT or tu.startswith("T&C") or tu.startswith("BUY"):
+                flush()
+            else:
+                cur["desc"].append(t)
+                if len(cur["desc"]) >= 2:
+                    flush()
+    flush()
+    return offers
+
+
+def extract_details(raw_texts, price_from_ld, extra_raw=None):
+    """Price, MRP, discount, offers. raw_texts = visible strings (original case)."""
+    price = price_from_ld
+    if not price:
+        for t in raw_texts[:300]:
+            if PRICE_RE.match(t):
+                price = int(re.sub(r"[^\d]", "", t.split(".")[0]))
+                break
+
+    # MRP: selling price ke bilkul aas-paas wali badi sankhya (ads / variants nahi)
+    mrp = None
+    if price:
+        for i, t in enumerate(raw_texts):
+            m = NUM_RE.match(t.strip())
+            if not (m and int(m.group(1).replace(",", "")) == price):
+                continue
+            best = None
+            for j in range(max(0, i - 4), min(len(raw_texts), i + 5)):
+                mj = NUM_RE.match(raw_texts[j].strip())
+                if mj and j != i:
+                    v = int(mj.group(1).replace(",", ""))
+                    if price < v < price * 10 and (best is None or abs(j - i) < best[0]):
+                        best = (abs(j - i), v)
+            if best:
+                mrp = best[1]
+                break
+    disc = f"{round((mrp - price) / mrp * 100)}%OFF" if (mrp and price) else None
+
+    offers = card_offers(raw_texts)
+    for extra in (extra_raw or []):
+        for o in card_offers(extra):
+            if o.lower() not in [x.lower() for x in offers]:
+                offers.append(o)
+
+    # purane layout wale labels + exchange + wow deal
     i = 0
     while i < len(raw_texts):
-        t = raw_texts[i]
+        t = raw_texts[i].strip()
         tu = t.upper()
         line = None
         if tu in OFFER_LABELS and i + 1 < len(raw_texts):
-            line = f"{t}: {raw_texts[i + 1]}"
+            line = f"{t}: {raw_texts[i + 1].strip()}"
             i += 1
         elif any(tu.startswith(l) for l in OFFER_LABELS) and len(t) > 15:
             line = t
-        elif "CARD" in tu and ("₹" in t or "%" in t) and any(k in tu for k in ("OFF", "CASHBACK", "DISCOUNT", "EMI")):
-            line = t
+        elif tu == "EXCHANGE OFFER":
+            nxt = [x.strip() for x in raw_texts[i + 1:i + 4] if x.strip().upper() not in SKIP_TXT]
+            if nxt:
+                line = "Exchange: " + " ".join(nxt[:2])
+        elif tu.startswith("BUY AT ₹"):
+            nxt = raw_texts[i + 1].strip() if i + 1 < len(raw_texts) else ""
+            line = "Deal: " + t + (" | " + nxt if nxt.upper().startswith("EMI") else "")
         if line:
-            line = re.sub(r"\s*T&C\s*$", "", line).strip()[:160]
-            if line not in offers:
+            line = re.sub(r"\s*T&C\s*$", "", line).strip()[:170]
+            if line.lower() not in [x.lower() for x in offers]:
                 offers.append(line)
         i += 1
-        if len(offers) >= 10:
-            break
-    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers}
+    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:20]}
+
+
+def decide2(h_up, r_up):
+    """Page (visible text) ko priority. Rome JSON ka 'NOT DELIVERABLE' template-string ho sakta hai."""
+    def first(lst, pred):
+        return next((t for t in lst if pred(t)), None)
+
+    h_loc = first(h_up, lambda t: any(k in t for k in LOC_OUT))
+    h_cta = first(h_up, lambda t: t in CTA_EXACT)
+    h_out = first(h_up, lambda t: t in OUT_EXACT or any(k in t for k in OUT_SUBSTR))
+    deliv = first(h_up + r_up, lambda t: bool(DELIV_RE.match(t)))
+    r_loc = first(r_up, lambda t: any(k in t for k in LOC_OUT))
+    note = " | ⚠ rome 'not deliverable' text mila (template ho sakta hai, ignore kiya)" if (r_loc and not h_loc) else ""
+
+    if h_loc:
+        return False, f"page: not deliverable '{h_loc[:50]}'"
+    if h_cta:
+        return True, f"page button '{h_cta}'" + note
+    if h_out:
+        return False, f"page: '{h_out[:50]}'"
+    if deliv:
+        return True, f"delivery mila: '{deliv[:40]}'" + note
+    if r_loc:
+        return False, "rome: not deliverable (page pe koi buy button nahi)"
+    return None, "no clear signal"
 
 
 def check_single_product(url: str, pincode: str):
@@ -203,8 +304,8 @@ def check_single_product(url: str, pincode: str):
         if r0.status_code in (403, 429, 529) or r0.status_code >= 500:
             return None, "Blocked", f"Flipkart ne block kiya (HTTP {r0.status_code})", {}
 
-        # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware result
-        rome_decision, rome_reason = None, "rome: no response"
+        # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware data
+        rome_raw, rome_note = [], "rome: no response"
         try:
             path = re.sub(r"^https?://[^/]+", "", r0.url)
             payload = {
@@ -219,14 +320,14 @@ def check_single_product(url: str, pincode: str):
             rr = s.post("https://2.rome.api.flipkart.com/api/4/page/fetch",
                         headers=rh, json=payload, timeout=15)
             if rr.status_code == 200:
-                rome_decision, rome_reason = decide(json_texts(rr.json()))
-                rome_reason = "rome: " + rome_reason
+                rome_raw = json_strings(rr.json())
+                rome_note = "rome:200"
             else:
-                rome_reason = f"rome: HTTP {rr.status_code}"
+                rome_note = f"rome:HTTP {rr.status_code}"
         except Exception as e:
-            rome_reason = f"rome error: {str(e)[:60]}"
+            rome_note = f"rome error: {str(e)[:50]}"
 
-        # 3) page HTML (title + fallback)
+        # 3) page HTML
         r = s.get(url, timeout=18, allow_redirects=True)
         if r.status_code in (403, 429, 529) or r.status_code >= 500:
             return None, "Blocked", f"Flipkart ne block kiya (HTTP {r.status_code})", {}
@@ -247,16 +348,15 @@ def check_single_product(url: str, pincode: str):
 
         ldp = ld_price(soup)                      # scripts hatane se pehle
         raw = html_texts(soup)
-        details = extract_details(raw, ldp)
-        upper = [t.upper() for t in raw if len(t) <= 120]
+        details = extract_details(raw, ldp, [rome_raw] if rome_raw else None)
 
-        if rome_decision is not None:
-            return rome_decision, title, rome_reason, details
+        h_up = [t.upper() for t in raw if len(t) <= 120]
+        r_up = [t.upper() for t in rome_raw if len(t) <= 120]
+        if len(h_up) < 20 and not r_up:
+            return None, title, f"page khali/captcha lag raha hai ({rome_note})", details
 
-        if len(upper) < 20:
-            return None, title, f"page khali/captcha lag raha hai ({rome_reason})", details
-        h_decision, h_reason = decide(upper)
-        return h_decision, title, f"html (pincode apply nahi hua ho sakta): {h_reason} | {rome_reason}", details
+        decision, why = decide2(h_up, r_up)
+        return decision, title, f"{why} | {rome_note}", details
 
     except Exception as e:
         print(f"Check error ({url[:40]}...):", e)
@@ -275,7 +375,7 @@ def fmt_price(item):
 
 
 def fmt_offers(item):
-    offs = (item.get("offers") or [])[:5]
+    offs = (item.get("offers") or [])[:8]
     if not offs:
         return ""
     return "🏷 <b>Offers</b>\n" + "\n".join("• " + o.replace("<", "").replace(">", "") for o in offs) + "\n\n"
