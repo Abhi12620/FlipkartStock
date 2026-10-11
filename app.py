@@ -170,38 +170,143 @@ SKIP_TXT = {"APPLY", "VIEW ALL", "VIEW ALL OFFERS", "BEST VALUE FOR YOU", "BANK 
 DELIV_RE = re.compile(r"^(DELIVERY|GET IT)\s+(BY|IN|ON)\b")
 
 
-def card_offers(raw):
-    """'₹7,584 off' + 'Flipkart Axis Bank Credit Card' jaise pairs se bank/card offers."""
-    offers, cur = [], None
+SECTION_HEADS = {
+    "BANK OFFERS": "Bank offers", "BANK OFFER": "Bank offers",
+    "EMI OFFERS": "EMI offers", "INSTANT LOAN OFFERS": "Instant loan offers",
+    "NO COST EMI OFFERS": "No cost EMI", "PARTNER OFFERS": "Partner offers",
+    "CREDIT CARD OFFERS": "Credit card offers", "WALLET OFFERS": "Wallet offers",
+}
+OFFER_AMT_RE = re.compile(
+    r"^(₹\s?[\d,]+(\.\d+)?|\d{1,2}(\.\d+)?\s?%)\s*(off\b|cashback\b|/\s?m(o|onth)?\b|per month\b)", re.I)
+STRONG_CARD = re.compile(
+    r"(CREDIT|DEBIT)\s+CARD|BANK|FINANCE|AXIS|SBI|HDFC|ICICI|KOTAK|AMEX|FEDERAL|IDFC|PNB|CITI|RBL|YES\b|ONECARD|BAJAJ|SLICE|UPI|WALLET|PAYTM|PHONEPE", re.I)
+JUNK_TXT = {"APPLY", "VIEW ALL", "VIEW ALL OFFERS", "T&C", "TERMS & CONDITIONS", "KNOW MORE"}
 
-    def flush():
-        nonlocal cur
-        if cur and cur["desc"]:
-            desc = " ".join(cur["desc"])
-            if CARD_WORDS.search(desc):
-                line = re.sub(r"\s*T&C\s*$", "", f"{cur['amt']} – {desc}").strip()[:170]
-                if line.lower() not in [o.lower() for o in offers]:
-                    offers.append(line)
-        cur = None
 
-    for t in raw:
-        t = t.strip()
-        tu = t.upper()
-        if AMT_RE.match(t) and len(t) < 110 and not tu.startswith("BUY"):
-            flush()
-            cur = {"amt": t, "desc": []}
-        elif cur is not None:
-            if tu in SKIP_TXT or tu in CTA_EXACT or tu.startswith("T&C") or tu.startswith("BUY"):
-                flush()
-            else:
-                cur["desc"].append(t)
-                if len(cur["desc"]) >= 2:
-                    flush()
-    flush()
+def _is_junk(s):
+    su = s.upper()
+    if su in JUNK_TXT or su.startswith("T&C") or su.startswith("HTTP"):
+        return True
+    if " " not in s and (len(s) > 25 or "_" in s):          # IDs jaise 13.ATLAS_PRODUCT...
+        return True
+    return len(s) > 140
+
+
+def _amount_ok(s):
+    if not OFFER_AMT_RE.match(s):
+        return False
+    m = re.search(r"[\d,]+(\.\d+)?", s)
+    return bool(m) and float(m.group(0).replace(",", "") or 0) > 0   # '₹0 off' hatao
+
+
+def _make_offer(sec, strings):
+    amt = next(s for s in strings if _amount_ok(s))
+    star = any(s.upper() == "BEST VALUE FOR YOU" for s in strings)
+    rest = [s for s in strings if s is not amt and s.upper() != "BEST VALUE FOR YOU"
+            and s.upper() not in SECTION_HEADS and not _is_junk(s)]
+    text = ("⭐ " if star else "") + amt + (" — " + " | ".join(rest[:3]) if rest else "")
+    return {"sec": sec or "Offers", "text": text[:200]}
+
+
+def card_offers_tree(root):
+    """Rome JSON ko STRUCTURE se padho: ek card = aisa sabse bada node jisme sirf ek amount ho.
+    Flat string pairing se garbage aata tha."""
+    cache = {}
+
+    def strs(node):
+        k = id(node)
+        if k in cache:
+            return cache[k]
+        out = []
+        kids = node.values() if isinstance(node, dict) else node
+        for ch in kids:
+            if isinstance(ch, str):
+                t = ch.strip()
+                if t:
+                    out.append(t)
+            elif isinstance(ch, (dict, list)):
+                out.extend(strs(ch))
+            if len(out) > 40:
+                break
+        cache[k] = out[:41]
+        return cache[k]
+
+    offers, state = [], {"sec": None}
+
+    def scan(node):
+        if isinstance(node, str):
+            h = SECTION_HEADS.get(node.strip().upper())
+            if h:
+                state["sec"] = h
+            return
+        if not isinstance(node, (dict, list)):
+            return
+        ss = strs(node)
+        if len(ss) <= 14:
+            amts = [s for s in ss if _amount_ok(s)]
+            if len(amts) == 1:
+                rest = " ".join(s for s in ss if s is not amts[0])
+                if STRONG_CARD.search(rest):
+                    for s in ss:                      # card ke andar heading ho to section update
+                        h = SECTION_HEADS.get(s.upper())
+                        if h:
+                            state["sec"] = h
+                    o = _make_offer(state["sec"], ss)
+                    if o["text"].lower() not in [x["text"].lower() for x in offers]:
+                        offers.append(o)
+                    return
+        for ch in (node.values() if isinstance(node, dict) else node):
+            scan(ch)
+
+    scan(root)
     return offers
 
 
-def extract_details(raw_texts, price_from_ld, extra_raw=None):
+def card_offers(raw):
+    """HTML ke visible strings se (fallback). Section headings bhi track karta hai."""
+    offers, state, i = [], {"sec": None}, 0
+    n = len(raw)
+    while i < n:
+        t = raw[i].strip()
+        h = SECTION_HEADS.get(t.upper())
+        if h:
+            state["sec"] = h
+        elif _amount_ok(t) and not t.upper().startswith("BUY"):
+            grp, j = [t], i + 1
+            while j < n and len(grp) < 5:
+                s = raw[j].strip()
+                if _amount_ok(s) or s.upper() in SECTION_HEADS or s.upper() in CTA_EXACT or s.upper() == "APPLY":
+                    break
+                grp.append(s)
+                j += 1
+            if STRONG_CARD.search(" ".join(grp[1:])):
+                o = _make_offer(state["sec"], grp)
+                if o["text"].lower() not in [x["text"].lower() for x in offers]:
+                    offers.append(o)
+            i = j - 1
+        i += 1
+    return offers
+
+
+def special_lines(raw):
+    """Exchange + Wow-deal lines."""
+    out = []
+    for i, t in enumerate(raw):
+        tu = t.strip().upper()
+        if tu == "EXCHANGE OFFER" or tu.startswith("EXCHANGE OFFER "):
+            nxt = [x.strip() for x in raw[i + 1:i + 5] if x.strip().upper() not in JUNK_TXT and not _is_junk(x.strip())]
+            joined = (t + " " + " ".join(nxt)).upper()
+            if "NOT AVAILABLE" in joined:
+                out.append({"sec": "Exchange", "text": "Not available at this pincode"})
+            elif nxt:
+                out.append({"sec": "Exchange", "text": " ".join(nxt[:2])})
+        elif tu.startswith("BUY AT ₹"):
+            nxt = raw[i + 1].strip() if i + 1 < len(raw) else ""
+            out.append({"sec": "Deal", "text": t.strip() + (" | " + nxt if nxt.upper().startswith("EMI") else "")})
+    return out
+
+
+def extract_details(raw_texts, price_from_ld, rome_json=None, rome_raw=None):
     """Price, MRP, discount, offers. raw_texts = visible strings (original case)."""
     price = price_from_ld
     if not price:
@@ -229,36 +334,15 @@ def extract_details(raw_texts, price_from_ld, extra_raw=None):
                 break
     disc = f"{round((mrp - price) / mrp * 100)}%OFF" if (mrp and price) else None
 
-    offers = card_offers(raw_texts)
-    for extra in (extra_raw or []):
-        for o in card_offers(extra):
-            if o.lower() not in [x.lower() for x in offers]:
-                offers.append(o)
-
-    # purane layout wale labels + exchange + wow deal
-    i = 0
-    while i < len(raw_texts):
-        t = raw_texts[i].strip()
-        tu = t.upper()
-        line = None
-        if tu in OFFER_LABELS and i + 1 < len(raw_texts):
-            line = f"{t}: {raw_texts[i + 1].strip()}"
-            i += 1
-        elif any(tu.startswith(l) for l in OFFER_LABELS) and len(t) > 15:
-            line = t
-        elif tu == "EXCHANGE OFFER":
-            nxt = [x.strip() for x in raw_texts[i + 1:i + 4] if x.strip().upper() not in SKIP_TXT]
-            if nxt:
-                line = "Exchange: " + " ".join(nxt[:2])
-        elif tu.startswith("BUY AT ₹"):
-            nxt = raw_texts[i + 1].strip() if i + 1 < len(raw_texts) else ""
-            line = "Deal: " + t + (" | " + nxt if nxt.upper().startswith("EMI") else "")
-        if line:
-            line = re.sub(r"\s*T&C\s*$", "", line).strip()[:170]
-            if line.lower() not in [x.lower() for x in offers]:
-                offers.append(line)
-        i += 1
-    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:20]}
+    offers = card_offers_tree(rome_json) if rome_json is not None else []
+    if not offers:
+        offers = card_offers(raw_texts)
+    seen = set()
+    for o in special_lines(raw_texts) + special_lines(rome_raw or []):
+        if o["sec"] not in seen:                 # exchange/deal ek hi baar
+            seen.add(o["sec"])
+            offers.append(o)
+    return {"price": price, "mrp": mrp, "discount": disc, "offers": offers[:30]}
 
 
 def decide2(h_up, r_up):
@@ -305,7 +389,7 @@ def check_single_product(url: str, pincode: str):
             return None, "Blocked", f"Flipkart ne block kiya (HTTP {r0.status_code})", {}
 
         # 2) pincode apply karo (Flipkart ka page-fetch API) -> location-aware data
-        rome_raw, rome_note = [], "rome: no response"
+        rome_raw, rome_json, rome_note = [], None, "rome: no response"
         try:
             path = re.sub(r"^https?://[^/]+", "", r0.url)
             payload = {
@@ -320,7 +404,8 @@ def check_single_product(url: str, pincode: str):
             rr = s.post("https://2.rome.api.flipkart.com/api/4/page/fetch",
                         headers=rh, json=payload, timeout=15)
             if rr.status_code == 200:
-                rome_raw = json_strings(rr.json())
+                rome_json = rr.json()
+                rome_raw = json_strings(rome_json)
                 rome_note = "rome:200"
             else:
                 rome_note = f"rome:HTTP {rr.status_code}"
@@ -348,7 +433,7 @@ def check_single_product(url: str, pincode: str):
 
         ldp = ld_price(soup)                      # scripts hatane se pehle
         raw = html_texts(soup)
-        details = extract_details(raw, ldp, [rome_raw] if rome_raw else None)
+        details = extract_details(raw, ldp, rome_json, rome_raw)
 
         h_up = [t.upper() for t in raw if len(t) <= 120]
         r_up = [t.upper() for t in rome_raw if len(t) <= 120]
@@ -375,10 +460,19 @@ def fmt_price(item):
 
 
 def fmt_offers(item):
-    offs = (item.get("offers") or [])[:8]
+    import html as _h
+    offs = item.get("offers") or []
     if not offs:
         return ""
-    return "🏷 <b>Offers</b>\n" + "\n".join("• " + o.replace("<", "").replace(">", "") for o in offs) + "\n\n"
+    groups = {}
+    for o in offs:
+        sec, tx = (("Offers", o) if isinstance(o, str) else (o.get("sec", "Offers"), o.get("text", "")))
+        groups.setdefault(sec, []).append(tx)
+    lines = ["🏷 <b>Offers</b>"]
+    for sec, items in groups.items():
+        lines.append(f"<b>{_h.escape(sec)}</b>")
+        lines += ["• " + _h.escape(x) for x in items[:6]]
+    return "\n".join(lines)[:2200] + "\n\n"
 
 
 def update_product_status(product_id: str):
@@ -406,6 +500,8 @@ def update_product_status(product_id: str):
                         item[k] = details[k]
                 if details.get("offers"):
                     item["offers"] = details["offers"]
+                elif item.get("offers") and isinstance(item["offers"][0], str):
+                    item["offers"] = []          # purana (galat format) offers saaf
                 item["last_checked"] = now
                 old_status = item.get("last_status")
 
@@ -555,6 +651,23 @@ DASHBOARD_HTML = """
   </div>
 
   <script>
+    function esc(s) { return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+    function offersHtml(list) {
+      if (!list || !list.length) return '';
+      const g = {};
+      list.forEach(o => {
+        const sec = (typeof o === 'string') ? 'Offers' : (o.sec || 'Offers');
+        const tx = (typeof o === 'string') ? o : o.text;
+        (g[sec] = g[sec] || []).push(tx);
+      });
+      let h = '<details open style="margin:6px 0;font-size:0.78rem;color:#cbd5e1;"><summary style="cursor:pointer;color:#38bdf8;">🏷 ' + list.length + ' offers</summary>';
+      for (const sec in g) {
+        h += '<div style="margin:6px 0 2px;color:#fbbf24;font-weight:600;">' + esc(sec) + '</div><ul style="margin:0 0 0 16px;padding:0;">';
+        g[sec].forEach(t => { h += '<li style="margin-bottom:3px;">' + esc(t) + '</li>'; });
+        h += '</ul>';
+      }
+      return h + '</details>';
+    }
     async function loadProducts() {
       const res = await fetch('/api/products');
       const data = await res.json();
@@ -590,8 +703,7 @@ DASHBOARD_HTML = """
             ${p.price ? `<div style="margin:2px 0 4px;"><span style="color:#4ade80;font-weight:700;font-size:1.05rem;">₹${Number(p.price).toLocaleString('en-IN')}</span>
               ${p.mrp ? `<span style="color:#64748b;text-decoration:line-through;margin-left:8px;font-size:0.82rem;">₹${Number(p.mrp).toLocaleString('en-IN')}</span>` : ''}
               ${p.discount ? `<span style="color:#fbbf24;margin-left:8px;font-size:0.82rem;">${p.discount}</span>` : ''}</div>` : ''}
-            ${(p.offers && p.offers.length) ? `<details style="margin:4px 0;font-size:0.78rem;color:#94a3b8;"><summary style="cursor:pointer;color:#38bdf8;">🏷 ${p.offers.length} offers</summary>
-              <ul style="margin:4px 0 0 16px;padding:0;">${p.offers.map(o => `<li style="margin-bottom:3px;">${o}</li>`).join('')}</ul></details>` : ''}
+            ${offersHtml(p.offers)}
             <div class="url"><a href="${p.url}" target="_blank">${p.url}</a></div>
           </td>
           <td>${p.pincode}</td>
